@@ -150,21 +150,31 @@ def _resolve_lnk(path: Path) -> Path | None:
     return Path(out) if out else None
 
 
-@lru_cache(maxsize=1)
-def steam_dir() -> Path | None:
-    env = os.environ.get("SPECTRASONICS_STEAM")
+def _spectra_root(name: str) -> Path | None:
+    """STEAM (Omnisphere-era products) or SAGE (Stylus RMX): a folder or a .lnk to one."""
+    env = os.environ.get("SPECTRASONICS_" + name)
     if env:
         return Path(env)
     for base in (Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Spectrasonics",
                  Path("/Library/Application Support/Spectrasonics")):
-        if (base / "STEAM").is_dir():
-            return base / "STEAM"
-        lnk = base / "STEAM.lnk"
+        if (base / name).is_dir():
+            return base / name
+        lnk = base / (name + ".lnk")
         if lnk.exists():
             target = _resolve_lnk(lnk)
             if target and target.is_dir():
                 return target
     return None
+
+
+@lru_cache(maxsize=1)
+def steam_dir() -> Path | None:
+    return _spectra_root("STEAM")
+
+
+@lru_cache(maxsize=1)
+def sage_dir() -> Path | None:
+    return _spectra_root("SAGE")
 
 
 @lru_cache(maxsize=32)
@@ -279,6 +289,36 @@ def spectra_current(state: bytes) -> list[str]:
     return names
 
 
+# --------------------------------------------------------------- Stylus RMX
+# State: u32 len-16, u32 1, then a <StylusRMXMaster> document, NUL padded.
+# A .mlt_rmx multi is the same document, so loading one is a whole swap.
+# (.kit_rmx kits are single-part and a different shape - not supported yet.)
+
+
+def _rmx_presets() -> list[Preset]:
+    sage = sage_dir()
+    if sage is None:
+        raise FileNotFoundError("Spectrasonics SAGE folder not found (set SPECTRASONICS_SAGE)")
+    root = sage / "Stylus RMX" / "Patches" / "Multis"
+    if not root.is_dir():
+        raise FileNotFoundError("Stylus RMX library not installed: %s missing" % root)
+    return [Preset("rmx", f.stem.strip(), str(f.relative_to(root)).replace("\\", "/"), str(f))
+            for f in sorted(root.rglob("*.mlt_rmx"))]
+
+
+def _swap_root(state: bytes, doc: bytes, tag: bytes) -> bytes:
+    xi = state.index(b"<" + tag)
+    xe = state.index(b"</" + tag + b">") + len(tag) + 3
+    pi = doc.index(b"<" + tag)
+    pe = doc.index(b"</" + tag + b">") + len(tag) + 3
+    return _fix_outer(state[:xi] + doc[pi:pe] + state[xe:])
+
+
+def _rmx_load(state: bytes, multi: bytes) -> tuple[bytes, str]:
+    m = re.search(rb'MultiName="([^"]*)"', multi[:2000])
+    return _swap_root(state, multi, b"StylusRMXMaster"), (m.group(1).decode("utf-8", "replace") if m else "")
+
+
 # --------------------------------------------------------------------- BFD
 
 
@@ -301,17 +341,14 @@ def _bfd_presets() -> list[Preset]:
 
 
 def _bfd_load(state: bytes, preset: bytes) -> tuple[bytes, str]:
-    xi = state.index(b"<root")
-    xe = state.index(b"</root>") + len(b"</root>")
     pi = preset.index(b"<root")
-    pe = preset.index(b"</root>") + len(b"</root>")
     m = re.search(rb'PresetName="([^"]*)"', preset[pi:pi + 2000])
-    return _fix_outer(state[:xi] + preset[pi:pe] + state[xe:]), (m.group(1).decode() if m else "")
+    return _swap_root(state, preset, b"root"), (m.group(1).decode() if m else "")
 
 
 # ------------------------------------------------------------------- public
 
-INSTRUMENTS = ("keyscape", "trilian", "omnisphere", "bfd")
+INSTRUMENTS = ("keyscape", "trilian", "omnisphere", "rmx", "bfd")
 
 
 def instrument_for(fx_name: str) -> str | None:
@@ -319,6 +356,8 @@ def instrument_for(fx_name: str) -> str | None:
     for key in ("keyscape", "trilian", "omnisphere"):
         if key in n:
             return key
+    if "stylus rmx" in n:
+        return "rmx"
     if "bfd" in n:
         return "bfd"
     return None
@@ -327,6 +366,8 @@ def instrument_for(fx_name: str) -> str | None:
 def list_presets(instrument: str) -> list[Preset]:
     if instrument == "bfd":
         return _bfd_presets()
+    if instrument == "rmx":
+        return _rmx_presets()
     if instrument in SPECTRA:
         return _spectra_presets(instrument)
     raise ValueError("unsupported instrument %r; supported: %s" % (instrument, ", ".join(INSTRUMENTS)))
@@ -352,6 +393,8 @@ def apply_preset(chunk: str, fx_index: int, preset: Preset, part: int = 1) -> tu
     data = preset.read()
     if preset.instrument == "bfd":
         block.state, label = _bfd_load(block.state, data)
+    elif preset.instrument == "rmx":
+        block.state, label = _rmx_load(block.state, data)
     else:
         block.state, label = _spectra_load(block.state, data, part)
     return write_vst3(chunk, block), label or preset.name
@@ -362,4 +405,7 @@ def current_preset(chunk: str, fx_index: int, instrument: str) -> str | list[str
     if instrument == "bfd":
         m = re.search(rb'PresetName="([^"]*)"', state)
         return m.group(1).decode() if m else ""
+    if instrument == "rmx":
+        m = re.search(rb'MultiName="([^"]*)"', state)
+        return m.group(1).decode("utf-8", "replace") if m else ""
     return spectra_current(state)

@@ -423,12 +423,13 @@ def _track_chunk(track: str, path: Path) -> dict[str, Any]:
 def list_instrument_presets(instrument: str, query: str = "", limit: int = 40) -> dict[str, Any]:
     """List presets for an instrument whose sounds live inside its own GUI browser.
 
-    Supported: keyscape, trilian, omnisphere (Spectrasonics) and bfd (BFD
-    Player). These plugins load with no sound and REAPER's preset menu for them
-    is empty; use this to find a name, then load_instrument_preset.
+    Supported: keyscape, trilian, omnisphere, rmx (Stylus RMX multis) from
+    Spectrasonics, and bfd (BFD Player). These plugins load with no sound (RMX:
+    a test loop) and REAPER's preset menu for them is empty; use this to find a
+    name, then load_instrument_preset.
 
     Args:
-        instrument: keyscape | trilian | omnisphere | bfd
+        instrument: keyscape | trilian | omnisphere | rmx | bfd
         query: case-insensitive substring matched against name and category path.
         limit: max rows returned (the total is always reported).
     """
@@ -448,7 +449,7 @@ def list_instrument_presets(instrument: str, query: str = "", limit: int = 40) -
 
 @mcp.tool()
 def load_instrument_preset(track: str, preset: str, fx_index: int = -1, part: int = 1) -> dict[str, Any]:
-    """Load a preset into Keyscape / Trilian / Omnisphere / BFD Player without its GUI.
+    """Load a preset into Keyscape / Trilian / Omnisphere / Stylus RMX / BFD Player without its GUI.
 
     Rewrites the plugin's state inside the track chunk (see presets.py). One
     undo step. Never open these plugins' GUIs from eval_lua instead: a plugin

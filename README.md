@@ -63,7 +63,7 @@ a 4-track session from nothing and asserts on the resulting `.RPP`.
 | `eval_lua` | Run arbitrary ReaScript Lua. The whole API is reachable here; `print` is captured, the return value is JSON-encoded. |
 | `project_summary` | Structured live state: tempo, cursor, tracks (name, dB, pan, mute/solo, folder depth, FX chain, items with MIDI note counts), markers/regions. |
 | `read_rpp` | Save and read the project back as raw `.RPP` text. The verification path. |
-| `list_instrument_presets` | Browse presets of Keyscape / Trilian / Omnisphere / BFD Player from their libraries on disk. |
+| `list_instrument_presets` | Browse presets of Keyscape / Trilian / Omnisphere / Stylus RMX / BFD Player from their libraries on disk. |
 | `load_instrument_preset` | Load one of those presets into a track's plugin **without opening its GUI**, then read the chunk back to verify. |
 
 `eval_lua` already reaches everything in the ReaScript API; wrapping a thousand
@@ -89,6 +89,12 @@ the state and writes the track chunk back:
   containers: a `<FileSystem>` XML index of (name, offset, size), then payload.
   STEAM is found via `C:\ProgramData\Spectrasonics\STEAM(.lnk)` or
   `SPECTRASONICS_STEAM`.
+- **Stylus RMX**: an older engine with its own layout — state is `u32 len-16,
+  u32 1` then a `<StylusRMXMaster>` document, and a `.mlt_rmx` multi is that
+  same document, so it is swapped whole. Library is found via
+  `C:\ProgramData\Spectrasonics\SAGE(.lnk)` or `SPECTRASONICS_SAGE`. Unlike the
+  STEAM products it is not silent when fresh: it loads a "Sound Check" loop.
+  `.kit_rmx` kits are single-part and not supported yet.
 - **BFD Player**: state is a `<root>` document shaped exactly like a
   `.bfdplayer` preset; swap it whole. Library paths come from
   `%APPDATA%\BFD Drums\BFDPlayer\DataPaths.xml`.
@@ -131,6 +137,14 @@ and that every load is confirmed by reading the state back.
   plus `WM_COMMAND IDOK` to the `#32770` "Error" dialogs.
 - **An installed-but-missing expansion ships a 0-byte `.db`** (Trilian VIP).
   Skip it; don't let it fail the whole preset listing.
+- **Discarding unsaved changes without a dialog:** `Main_openProject("noprompt:" .. path)`.
+  To restart REAPER (e.g. to rescan plugins), switch to a clean project that
+  way, then quit with `reaper.defer(function() reaper.Main_OnCommand(40004, 0) end)`
+  so the bridge call returns before REAPER exits.
+- **Installers that ignore the standard folder.** A plugin installed to a
+  custom path is simply absent from the FX list, with no error. Add the folder
+  to `vstpath64` in `reaper.ini` while REAPER is closed; it rescans at startup.
+  Test new plugins with `test_plugins.py`.
 - **Metering from inside one Lua call doesn't work.** A busy loop in the bridge
   blocks the main thread, so `Track_GetPeakInfo` never updates. Sample across
   separate calls (`verify_audio.py`).
@@ -144,6 +158,7 @@ src/reaper_mcp/server.py MCP server and tools
 src/reaper_mcp/presets.py GUI-free preset loading (VST3 chunk + vendor state codecs)
 src/reaper_mcp/install.py bridge installer (backs up a pre-existing __startup.lua)
 test_presets.py          live: library index, byte-identical round trip, verified loads
+test_plugins.py          live: does each plugin load, make sound / pass audio, stay silent on dialogs
 song_neosoul.py          a song on Keyscape / Trilian / BFD, presets loaded by the tool
 smoke_test.py            transport / encoding / error-path tests
 test_save_adopt.py       regression: save_as must adopt the project filename
