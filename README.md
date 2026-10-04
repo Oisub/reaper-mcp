@@ -49,7 +49,8 @@ Register with Claude Code:
 claude mcp add reaper --scope user "<repo>/.venv/Scripts/reaper-mcp.exe"
 ```
 
-Then `/mcp` in Claude Code to reconnect.
+Then **restart the Claude Code session** — a newly added server is not picked
+up by `/mcp`. (`/mcp` reconnect is enough later, after code changes.)
 
 Verify: `uv run python smoke_test.py` — exercises type round-tripping, output
 capture, runtime errors and compile errors. `uv run python demo_build.py` builds
