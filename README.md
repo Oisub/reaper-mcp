@@ -96,6 +96,11 @@ the state and writes the track chunk back:
   `C:\ProgramData\Spectrasonics\SAGE(.lnk)` or `SPECTRASONICS_SAGE`. Unlike the
   STEAM products it is not silent when fresh: it loads a "Sound Check" loop.
   `.kit_rmx` kits are single-part and not supported yet.
+  RMX renames a loaded multi to "Untitled", so a load is verified by the loops
+  in its parts, not by `MultiName`. Playing it from MIDI: part n listens on
+  channel n, each loop's slices are mapped chromatically from note 36, velocity
+  is live (~24 dB from 30 to 127), a note-off cuts the slice, and grooves do not
+  auto-play with the transport.
 - **BFD Player**: state is a `<root>` document shaped exactly like a
   `.bfdplayer` preset; swap it whole. Library paths come from
   `%APPDATA%\BFD Drums\BFDPlayer\DataPaths.xml`.
