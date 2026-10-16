@@ -314,9 +314,14 @@ def _swap_root(state: bytes, doc: bytes, tag: bytes) -> bytes:
     return _fix_outer(state[:xi] + doc[pi:pe] + state[xe:])
 
 
+def _rmx_signature(doc: bytes) -> str:
+    """The loops in the multi's parts. RMX renames a loaded multi to "Untitled", so MultiName
+    cannot confirm a load; the part loops can."""
+    return " | ".join(x.decode("utf-8", "replace").strip() for x in re.findall(rb'Loop="([^"]*)"', doc))
+
+
 def _rmx_load(state: bytes, multi: bytes) -> tuple[bytes, str]:
-    m = re.search(rb'MultiName="([^"]*)"', multi[:2000])
-    return _swap_root(state, multi, b"StylusRMXMaster"), (m.group(1).decode("utf-8", "replace") if m else "")
+    return _swap_root(state, multi, b"StylusRMXMaster"), _rmx_signature(multi)
 
 
 # --------------------------------------------------------------------- BFD
@@ -406,6 +411,5 @@ def current_preset(chunk: str, fx_index: int, instrument: str) -> str | list[str
         m = re.search(rb'PresetName="([^"]*)"', state)
         return m.group(1).decode() if m else ""
     if instrument == "rmx":
-        m = re.search(rb'MultiName="([^"]*)"', state)
-        return m.group(1).decode("utf-8", "replace") if m else ""
+        return _rmx_signature(state)
     return spectra_current(state)
