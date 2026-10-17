@@ -23,7 +23,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-from reaper_mcp import presets
+from reaper_mcp import presets, separate
 
 POLL_INTERVAL = 0.025
 DEFAULT_TIMEOUT = 20.0
@@ -508,6 +508,282 @@ def load_instrument_preset(track: str, preset: str, fx_index: int = -1, part: in
     finally:
         src.unlink(missing_ok=True)
         dst.unlink(missing_ok=True)
+
+
+# ----------------------------------------------------------- stem separation
+
+
+_SELECTED_ITEMS_LUA = r"""
+local items = {}
+for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
+  local item = reaper.GetSelectedMediaItem(0, i)
+  local take = reaper.GetActiveTake(item)
+  if take and not reaper.TakeIsMIDI(take) then
+    local src = reaper.GetMediaItemTake_Source(take)
+    local parent = reaper.GetMediaSourceParent(src)
+    while parent do src = parent parent = reaper.GetMediaSourceParent(src) end
+    local tr = reaper.GetMediaItem_Track(item)
+    items[#items + 1] = {
+      file = reaper.GetMediaSourceFileName(src, ""),
+      pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION"),
+      len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH"),
+      offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS"),
+      rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE"),
+      item_guid = select(2, reaper.GetSetMediaItemInfo_String(item, "GUID", "", false)),
+      track_guid = reaper.GetTrackGUID(tr),
+    }
+  end
+end
+return { items = items, project = select(2, reaper.EnumProjects(-1, "")) }
+"""
+
+# Shared by both layouts: add one track holding one audio item.
+_ADD_TRACK_LUA = r"""
+local function add_track(idx, name, path, mute, place, color)
+  reaper.InsertTrackAtIndex(idx, false)
+  local tr = reaper.GetTrack(0, idx)
+  reaper.GetSetMediaTrackInfo_String(tr, "P_NAME", name, true)
+  if color then reaper.SetMediaTrackInfo_Value(tr, "I_CUSTOMCOLOR", color) end
+  local src = reaper.PCM_Source_CreateFromFile(path)
+  if not src then error("cannot open " .. path) end
+  local item = reaper.AddMediaItemToTrack(tr)
+  local take = reaper.AddTakeToMediaItem(item)
+  reaper.SetMediaItemTake_Source(take, src)
+  reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", name, true)
+  reaper.SetMediaItemInfo_Value(item, "D_POSITION", place and place.pos or 0)
+  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", place and place.len or reaper.GetMediaSourceLength(src))
+  if place then
+    reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", place.offs)
+    reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", place.rate)
+  end
+  reaper.SetMediaTrackInfo_Value(tr, "B_MUTE", mute and 1 or 0)
+  return tr
+end
+local STEM_COLOR = reaper.ColorToNative(80, 160, 255) | 0x1000000
+"""
+
+# A new project tab: the original mix (muted) and one track per stem, saved next to the stems.
+_LOAD_NEW_TAB_LUA = _ADD_TRACK_LUA + r"""
+local spec = __SPEC__
+reaper.Main_OnCommand(40859, 0) -- new project tab
+add_track(0, spec.title .. " (mix)", spec.mix, true)
+for i, s in ipairs(spec.stems) do
+  add_track(i, s.name, s.path, s.mute, nil, (not s.mute and spec.audition ~= "") and STEM_COLOR or nil)
+end
+reaper.Main_OnCommand(40047, 0) -- build missing peaks
+reaper.Main_OnCommand(40295, 0) -- zoom to project
+reaper.SetEditCurPos(0, true, false)
+-- options=8 adopts the filename, so a later save never opens a Save-As dialog
+reaper.Main_SaveProjectEx(0, spec.rpp, 8)
+return { project = select(2, reaper.EnumProjects(-1, "")), tracks = reaper.CountTracks(0) }
+"""
+
+# Into the project the source item came from: a folder of stems right under the source
+# track, aligned to the item (same position, length, offset, rate); the source item is muted.
+_LOAD_TRACKS_LUA = _ADD_TRACK_LUA + r"""
+local spec = __SPEC__
+local proj, src_tr
+local p = 0
+while not src_tr do
+  local pr = reaper.EnumProjects(p)
+  if not pr then break end
+  for t = 0, reaper.CountTracks(pr) - 1 do
+    local tr = reaper.GetTrack(pr, t)
+    if reaper.GetTrackGUID(tr) == spec.track_guid then proj, src_tr = pr, tr break end
+  end
+  p = p + 1
+end
+if not src_tr then error("source track is gone (project closed?)") end
+reaper.SelectProjectInstance(proj) -- InsertTrackAtIndex only works on the active project
+local at = math.floor(reaper.GetMediaTrackInfo_Value(src_tr, "IP_TRACKNUMBER"))
+reaper.InsertTrackAtIndex(at, false)
+local folder = reaper.GetTrack(0, at)
+reaper.GetSetMediaTrackInfo_String(folder, "P_NAME", "Stems: " .. spec.title, true)
+reaper.SetMediaTrackInfo_Value(folder, "I_FOLDERDEPTH", 1)
+local last
+for i, s in ipairs(spec.stems) do
+  last = add_track(at + i, s.name, s.path, s.mute, spec.place, (not s.mute and spec.audition ~= "") and STEM_COLOR or nil)
+end
+reaper.SetMediaTrackInfo_Value(last, "I_FOLDERDEPTH", -1)
+for i = 0, reaper.CountTrackMediaItems(src_tr) - 1 do
+  local it = reaper.GetTrackMediaItem(src_tr, i)
+  if select(2, reaper.GetSetMediaItemInfo_String(it, "GUID", "", false)) == spec.item_guid then
+    reaper.SetMediaItemInfo_Value(it, "B_MUTE", 1)
+  end
+end
+reaper.Main_OnCommand(40047, 0)
+reaper.UpdateArrange()
+return { project = select(2, reaper.EnumProjects(-1, "")), folder = "Stems: " .. spec.title, at_track = at + 1 }
+"""
+
+
+def _lua_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return _lua_str(v)
+    if isinstance(v, dict):
+        return "{" + ", ".join("[" + _lua_str(k) + "] = " + _lua_value(x) for k, x in v.items()) + "}"
+    if isinstance(v, (list, tuple)):
+        return "{" + ", ".join(_lua_value(x) for x in v) + "}"
+    if v is None:
+        return "nil"
+    raise TypeError(type(v))
+
+
+def _load_stems(job: separate.Job, item: separate.Item) -> Any:
+    src = Path(item.src)
+    audition = job.audition.lower()
+    stems = [
+        {"name": name.capitalize(), "path": path, "mute": bool(audition) and name != audition}
+        for name, path in separate.ordered_stems(item.stems)
+    ]
+    spec: dict[str, Any] = {"title": src.stem, "mix": str(src), "stems": stems, "audition": audition}
+    if job.load == "tracks" and item.placement:
+        spec.update(track_guid=item.placement["track_guid"], item_guid=item.placement["item_guid"],
+                    place={k: item.placement[k] for k in ("pos", "len", "offs", "rate")})
+        code = _LOAD_TRACKS_LUA
+    else:
+        spec["rpp"] = str(Path(item.out) / (src.stem + ".rpp"))
+        code = _LOAD_NEW_TAB_LUA
+    res = _call(code.replace("__SPEC__", _lua_value(spec)), undo_label="MCP: load stems " + src.stem, timeout=60)
+    return res.get("result") if res.get("status") == "ok" else {"status": "error", "error": res.get("error")}
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_separation_models(query: str = "") -> dict[str, Any]:
+    """List the stem-separation models separate_stems can use.
+
+    Without a query: the curated models (alias, stems, notes, whether already
+    downloaded) and the separator configuration. With a query: also search
+    audio-separator's full catalog (~170 models) by name, filename or stem,
+    e.g. "drums", "karaoke", "dereverb". Any catalog filename works as `model`.
+    """
+    cfg = separate.config()
+    out: dict[str, Any] = {
+        "status": "ok",
+        "default": separate.DEFAULT_MODEL,
+        "config": cfg,
+        "models": [
+            {"alias": m.alias, "filename": m.filename, "stems": list(m.stems), "note": m.note,
+             "downloaded": separate.model_on_disk(m, cfg["model_dir"])}
+            for m in separate.MODELS
+        ],
+    }
+    if query:
+        try:
+            out["catalog_matches"] = separate.catalog(query)
+        except Exception as exc:
+            out["catalog_error"] = str(exc)
+    return out
+
+
+@mcp.tool()
+def separate_stems(
+    source: str = "selected_item",
+    model: str = separate.DEFAULT_MODEL,
+    load: str = "auto",
+    output_dir: str = "",
+    audition: str = "",
+    device: str = "auto",
+) -> dict[str, Any]:
+    """Split audio into stems (vocals, drums, bass, guitar, piano, ...) and load them into REAPER.
+
+    Runs in the background - a song takes minutes - and returns a job id at
+    once; each song is loaded into REAPER as soon as it is done. Check on it
+    with separation_status. Finished songs are skipped on a rerun, so a batch
+    can be resumed.
+
+    Args:
+        source: "selected_item" (every selected audio item), an audio file, or a
+            folder (every audio file in it).
+        model: alias from list_separation_models (default bs_roformer_sw, 6 stems)
+            or any audio-separator model filename.
+        load: "tracks" = folder of stems under the source track, aligned to the
+            item, source item muted; "new_tab" = new project tab with the mix
+            (muted) and the stems, saved next to them; "none"; "auto" = tracks
+            for selected items, new_tab for one file, none for several.
+        output_dir: root folder; stems go to <root>/<song>/<model>/<stem>.flac.
+            Default: "Stems" next to the saved project (selected items) or next
+            to the source file.
+        audition: a stem name (e.g. "bass") to leave unmuted, muting the others.
+        device: auto | cpu | cuda | xpu (auto picks CUDA, then Intel XPU, then CPU).
+    """
+    m = separate.resolve_model(model)
+    placements: list[dict[str, Any] | None] = []
+    project = ""
+    try:
+        if source.strip().lower() in ("selected_item", "selected_items", "selected"):
+            res = _call(_SELECTED_ITEMS_LUA, undo_label="", timeout=10)
+            if res.get("status") != "ok":
+                return res
+            sel = res["result"] or {}
+            project = sel.get("project") or ""
+            picked = [it for it in (sel.get("items") or []) if it.get("file")]
+            if not picked:
+                return {"status": "error", "error": "no audio item selected in REAPER"}
+            files = [Path(it["file"]) for it in picked]
+            placements = picked
+        else:
+            files = separate.expand_sources([source])
+            if not files:
+                return {"status": "error", "error": "no audio files in " + source}
+            placements = [None] * len(files)
+    except (BridgeError, FileNotFoundError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    if load == "auto":
+        load = "tracks" if placements[0] else ("new_tab" if len(files) == 1 else "none")
+    if load not in ("tracks", "new_tab", "none"):
+        return {"status": "error", "error": "load must be auto, tracks, new_tab or none"}
+    if load == "tracks" and not placements[0]:
+        return {"status": "error", "error": "load=tracks needs source=selected_item"}
+
+    if output_dir:
+        root = Path(output_dir)
+    elif project:
+        root = Path(project).parent / "Stems"
+    else:
+        root = files[0].parent / "Stems"
+
+    items = [separate.Item(src=str(f), out=str(separate.song_dir(root, f, m)), placement=p)
+             for f, p in zip(files, placements)]
+    job = separate.Job(id=separate.new_id(), model=m, device=device, load=load,
+                       audition=audition.strip().lower(), items=items)
+    separate.start(job, _call, _load_stems)
+    cfg = separate.config()
+    return {
+        "status": "ok",
+        "job_id": job.id,
+        "model": m.alias,
+        "songs": len(items),
+        "load": load,
+        "output_root": str(root),
+        "model_downloaded": separate.model_on_disk(m, cfg["model_dir"]),
+        "note": "running in the background; roughly 3-5 min per song on an Intel iGPU, "
+        "10-15 on CPU. Use separation_status to follow it.",
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def separation_status(job_id: str = "") -> dict[str, Any]:
+    """Progress of separate_stems jobs: one job by id, or all jobs of this session (newest first)."""
+    if job_id:
+        job = separate.JOBS.get(job_id)
+        return job.summary() if job else {"status": "error", "error": "no job " + job_id}
+    return {"jobs": [j.summary() for j in sorted(separate.JOBS.values(), key=lambda j: -j.started)]}
+
+
+@mcp.tool()
+def cancel_separation(job_id: str) -> dict[str, Any]:
+    """Stop a running separate_stems job. Songs already finished stay on disk (and in REAPER)."""
+    job = separate.JOBS.get(job_id)
+    if not job:
+        return {"status": "error", "error": "no job " + job_id}
+    separate.cancel(job)
+    return job.summary()
 
 
 def main() -> None:

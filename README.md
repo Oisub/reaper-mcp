@@ -66,6 +66,9 @@ a 4-track session from nothing and asserts on the resulting `.RPP`.
 | `read_rpp` | Save and read the project back as raw `.RPP` text. The verification path. |
 | `list_instrument_presets` | Browse presets of Keyscape / Trilian / Omnisphere / Stylus RMX / BFD Player from their libraries on disk. |
 | `load_instrument_preset` | Load one of those presets into a track's plugin **without opening its GUI**, then read the chunk back to verify. |
+| `list_separation_models` | Stem-separation models: the curated set (default BS-RoFormer SW, 6 stems) plus a search over audio-separator's full catalog. |
+| `separate_stems` | Split the selected item(s), a file or a folder into stems in the background, and load each song into REAPER as it finishes. |
+| `separation_status` / `cancel_separation` | Follow or stop a separation job. |
 
 `eval_lua` already reaches everything in the ReaScript API; wrapping a thousand
 functions one-by-one would add surface area without adding capability, and
@@ -111,6 +114,44 @@ the state and writes the track chunk back:
 
 `test_presets.py` checks that an untouched chunk re-encodes byte-identically,
 and that every load is confirmed by reading the state back.
+
+## Stem separation
+
+Not reachable from ReaScript at all, hence a tool. `separate_stems` runs
+[python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator)
+in a **separate Python environment** through `separate_worker.py`, so this
+server stays a small `mcp`-only install and the heavy environment can carry
+whatever torch build the machine needs:
+
+```bash
+uv venv <sep-env> --python 3.12
+uv pip install --python <sep-env>/python torch torchaudio --index-url https://download.pytorch.org/whl/xpu  # or cu126 / cpu
+uv pip install --python <sep-env>/python audio-separator onnxruntime audioread
+```
+
+Point the server at it in `~/.reaper-mcp/separator.json`
+(`{"python": "<sep-env>/python", "model_dir": "<models>"}`) or with
+`REAPER_MCP_SEPARATOR_PYTHON` / `REAPER_MCP_SEPARATOR_MODELS`. Without either it
+uses its own interpreter and `~/.reaper-mcp/separator-models`.
+
+- **Models.** Default `bs_roformer_sw` (vocals, drums, bass, guitar, piano,
+  other) is the strongest public multi-stem model on MVSep's Multisong
+  leaderboard (bass SDR 14.62 vs ~12.0 for `htdemucs_ft`). Its original host is
+  gone, so it is fetched from a Hugging Face mirror on first use. Any other
+  audio-separator filename can be passed as `model`.
+- **Devices.** `auto` takes CUDA, then **Intel XPU**, then CPU. audio-separator
+  has no XPU support of its own; the worker pins the torch device. On an
+  Intel Arc iGPU that is ~2.4x CPU with identical output.
+- **Jobs run in the background** (minutes per song) and each song is loaded as
+  soon as it is done: `tracks` puts a stem folder under the source track,
+  aligned to the item (position, length, offset, rate) and mutes the source
+  item; `new_tab` opens a project with the mix (muted) and the stems, saved next
+  to them. `audition="bass"` leaves just that stem unmuted.
+- **Output** is `<root>/<song>/<model>/<stem>.flac` plus a `stems.json`
+  manifest; a song with a manifest is skipped, so batches resume.
+- The worker runs at below-normal priority so the machine stays usable.
+
+`test_separate.py` covers both layouts, resume and cancel on a synthetic clip.
 
 ## Gotchas found the hard way
 
@@ -163,6 +204,9 @@ bridge/mcp_bridge.lua    the bridge itself
 src/reaper_mcp/server.py MCP server and tools
 src/reaper_mcp/presets.py GUI-free preset loading (VST3 chunk + vendor state codecs)
 src/reaper_mcp/install.py bridge installer (backs up a pre-existing __startup.lua)
+src/reaper_mcp/separate.py stem separation: model catalog, config, background jobs
+src/reaper_mcp/separate_worker.py runs in the separator's own Python (audio-separator)
+test_separate.py         live: stem separation, both load layouts, resume, cancel
 test_presets.py          live: library index, byte-identical round trip, verified loads
 test_plugins.py          live: does each plugin load, make sound / pass audio, stay silent on dialogs
 song_neosoul.py          a song on Keyscape / Trilian / BFD, presets loaded by the tool
